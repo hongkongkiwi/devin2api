@@ -1322,5 +1322,8 @@ window.I18N_LOCALES['en'] = {
   'tokens.createSectionModels': 'Models & Activation',
 
   // logs
-  'logs.debugMergeFailed': 'Merge response failed'
+  'logs.debugMergeFailed': 'Merge response failed',
+
+  // model test chat (markdown-renderer shared renderer)
+  'modelTest.chat.thinking': 'Thinking'
 };

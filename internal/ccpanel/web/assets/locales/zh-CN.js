@@ -1321,5 +1321,8 @@ window.I18N_LOCALES['zh-CN'] = {
   'tokens.createSectionModels': '模型与启用',
 
   // logs
-  'logs.debugMergeFailed': '合并响应失败'
+  'logs.debugMergeFailed': '合并响应失败',
+
+  // model test chat (markdown-renderer shared renderer)
+  'modelTest.chat.thinking': '思考'
 };
