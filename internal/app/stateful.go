@@ -33,7 +33,7 @@ const maxResponseChainDepth = 32
 const statefulPersistTimeout = 5 * time.Second
 
 // statefulTurn 记录一次 openai-responses 请求的 stateful 适配产物：
-// 解码前由 prepareResponsesStateful 填前四个字段，响应完成后由
+// 解码后由 adaptResponsesStateful 填前四个字段，响应完成后由
 // persistStateful 消费 responseJSON 落库。
 type statefulTurn struct {
 	// store 是客户端是否要求存储本次响应（store:true；缺省 false，
@@ -51,67 +51,65 @@ type statefulTurn struct {
 	responseJSON []byte
 }
 
-// prepareResponsesStateful 在解码前消费请求体里的 store 与
-// previous_response_id：续链请求按 key_hash 隔离上溯祖先链，把增量
-// input 物化成「祖先 input+output 全量 + 本次增量」后改写 body
-// （剥离 previous_response_id——与 WS 会话同口径，管线只认全量），
-// store 请求登记落库意图。未接线存储仓或请求无 stateful 字段时原样
-// 返回（previous_response_id 仍会被 protocols.go 的安全网 400 拒绝）。
-// status 非 0 表示管线前拒绝（404 链断 / 400 链过深 / body 畸形）。
-func (application *App) prepareResponsesStateful(ctx context.Context, body []byte, keyHash string) (turn *statefulTurn, rewritten []byte, status int, err error) {
-	if application.responsesStore == nil {
-		return nil, body, 0, nil
+// adaptResponsesStateful 在首次解码后消费 stateful 字段（options 已带
+// store 与 previous_response_id 真值）：store 请求登记落库意图并归一化
+// 增量 input；续链请求按 key_hash 隔离上溯祖先链，把增量 input 物化成
+// 「祖先 input+output 全量 + 本次增量」改写 body（剥离 previous_response_id
+// ——与 WS 会话同口径，管线只认全量）。rewritten 非 nil 表示 body 已被
+// 改写，调用方须重新解码出全量上下文。无 stateful 字段的请求（绝大多数）
+// 在首判即原样返回，不付任何额外解析成本；stateful 请求的两遍解析
+// （顶层切片 + 改写后重解码）只落在它们自己身上。status 非 0 表示拒绝
+// （404 链断 / 400 链过深或续链未带 store / 400 未接线存储）。
+func (application *App) adaptResponsesStateful(ctx context.Context, body []byte, keyHash string, options protocolOptions) (turn *statefulTurn, rewritten []byte, status int, err error) {
+	if !options.Store && options.PreviousResponseID == "" {
+		return nil, nil, 0, nil
 	}
-	var probe struct {
-		Store    bool            `json:"store"`
-		Previous string          `json:"previous_response_id"`
-		Input    json.RawMessage `json:"input"`
+	// 续链要求存储仓接线且本次响应入库：增量 input 的正确性依赖整条
+	// 链可回放，而回放依赖本次响应成为下一轮祖先——store:false 的续链
+	// 在 OpenAI 侧同样不成立，显式 400 比静默断链便宜。未接线时 store
+	// 单独出现只降级（响应如实回显 store:false），续链则拒绝。
+	if options.PreviousResponseID != "" {
+		if application.responsesStore == nil {
+			return nil, nil, http.StatusBadRequest, fmt.Errorf(
+				"previous_response_id %q requires a server-side response store, which is not available on this instance — resend the full conversation input without previous_response_id",
+				options.PreviousResponseID)
+		}
+		if !options.Store {
+			return nil, nil, http.StatusBadRequest,
+				errors.New("previous_response_id requires store=true; resend the full conversation input without previous_response_id")
+		}
 	}
-	if err := json.Unmarshal(body, &probe); err != nil {
-		return nil, body, http.StatusBadRequest, fmt.Errorf("decode responses request: %w", err)
+	turn = &statefulTurn{store: options.Store, parentID: options.PreviousResponseID, keyHash: keyHash}
+	// 顶层切片解码：每个顶层值保持 RawMessage 原样（不建嵌套值树），
+	// 改写路径与增量 input 提取共用同一次遍历。
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, nil, http.StatusBadRequest, fmt.Errorf("decode responses request: %w", err)
 	}
-	if !probe.Store && probe.Previous == "" {
-		return nil, body, 0, nil
+	if turn.inputJSON, err = normalizeResponsesInput(doc["input"]); err != nil {
+		return nil, nil, http.StatusBadRequest, err
 	}
-	// 续链要求存储：增量 input 的正确性依赖整条链可回放，而回放依赖
-	// 本次响应入库成为下一轮祖先——store:false 的续链在 OpenAI 侧同样
-	// 不成立，显式 400 比静默断链便宜。
-	if probe.Previous != "" && !probe.Store {
-		return nil, body, http.StatusBadRequest,
-			errors.New("previous_response_id requires store=true; resend the full conversation input without previous_response_id")
+	if turn.parentID == "" {
+		return turn, nil, 0, nil
 	}
-	turn = &statefulTurn{store: probe.Store, parentID: probe.Previous, keyHash: keyHash}
-	turn.inputJSON, err = normalizeResponsesInput(probe.Input)
-	if err != nil {
-		return nil, body, http.StatusBadRequest, err
-	}
-	if probe.Previous == "" {
-		return turn, body, 0, nil
-	}
-	chain, err := application.responsesStore.ResponseChain(ctx, probe.Previous, keyHash, maxResponseChainDepth)
+	chain, err := application.responsesStore.ResponseChain(ctx, turn.parentID, keyHash, maxResponseChainDepth)
 	switch {
 	case errors.Is(err, store.ErrResponseNotFound):
-		return nil, body, http.StatusNotFound, fmt.Errorf("no response found with id '%s' (previous_response_id)", probe.Previous)
+		return nil, nil, http.StatusNotFound, fmt.Errorf("no response found with id '%s' (previous_response_id)", turn.parentID)
 	case errors.Is(err, store.ErrResponseChainTooDeep):
-		return nil, body, http.StatusBadRequest, fmt.Errorf("previous_response_id chain from '%s' exceeds %d ancestors; resend the full conversation input", probe.Previous, maxResponseChainDepth)
+		return nil, nil, http.StatusBadRequest, fmt.Errorf("previous_response_id chain from '%s' exceeds %d ancestors; resend the full conversation input", turn.parentID, maxResponseChainDepth)
 	case err != nil:
-		return nil, body, http.StatusInternalServerError, fmt.Errorf("resolve response chain from '%s': %w", probe.Previous, err)
+		return nil, nil, http.StatusInternalServerError, fmt.Errorf("resolve response chain from '%s': %w", turn.parentID, err)
 	}
 	merged, err := materializeChainInput(chain, turn.inputJSON)
 	if err != nil {
-		return nil, body, http.StatusInternalServerError, err
-	}
-	// map[string]json.RawMessage 的往返不建值树：未触碰字段原样搬运，
-	// 只有 input 被替换、previous_response_id 被剥离。
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, body, http.StatusBadRequest, fmt.Errorf("decode responses request: %w", err)
+		return nil, nil, http.StatusInternalServerError, err
 	}
 	doc["input"] = merged
 	delete(doc, "previous_response_id")
 	rewritten, err = json.Marshal(doc)
 	if err != nil {
-		return nil, body, http.StatusInternalServerError, fmt.Errorf("rewrite stateful input: %w", err)
+		return nil, nil, http.StatusInternalServerError, fmt.Errorf("rewrite stateful input: %w", err)
 	}
 	return turn, rewritten, 0, nil
 }

@@ -31,11 +31,14 @@ type Request struct {
 	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
 	// Temperature 是可选的采样温度。
 	Temperature *float64 `json:"temperature,omitempty"`
-	// PreviousResponseID 是调用方提供的上游响应关联标识。本代理无服务端
-	// 响应存储（store=false），HTTP 路径上非空即在 app 层 400 拒绝——
-	// 否则增量 input 会被当全量，上下文静默丢失；WS 会话路径在规范化
-	// 阶段已剥离该字段做本地合并，不受影响。
+	// PreviousResponseID 是调用方提供的上游响应关联标识。stateful 语义
+	//（续链物化、未接线时的拒绝）由 app 层在解码后适配（app/stateful.go），
+	// 本层只负责把它带出给调用方；WS 会话路径在规范化阶段已剥离该字段
+	// 做本地合并，不受影响。
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
+	// Store 是调用方是否要求服务端存储本次响应。是否落库由 app 层决定，
+	// 本层只透传真值——语义见 app/stateful.go。
+	Store bool `json:"store,omitempty"`
 	// TopP 是可选的 nucleus 采样参数。
 	TopP *float64 `json:"top_p,omitempty"`
 	// User 是可选的调用方用户标识。
@@ -50,10 +53,9 @@ type Request struct {
 
 // responsesRequestFields 是 DecodeRequest 已消费的顶层字段；其余字段
 // （reasoning/service_tier/include 等）上游没有对应物，记入 Dropped
-// 透出而不是静默吞掉。previous_response_id 由 app 层 stateful 适配在
-// 解码前消费（续链改写为全量 input 后剥离，见 app/stateful.go）；store
-// 同样在 app 层消费——响应是否落存储由 app 决定，本层只标记已读避免
-// 落进 dropped。
+// 透出而不是静默吞掉。previous_response_id 与 store 的 stateful 语义
+// 由 app 层消费（app/stateful.go），本层带出真值并标记已读避免落进
+// dropped。
 var responsesRequestFields = map[string]bool{
 	"model": true, "instructions": true, "input": true, "tools": true,
 	"stream": true, "max_output_tokens": true, "temperature": true,
@@ -112,6 +114,9 @@ type RequestOptions struct {
 	Stream bool
 	// PreviousResponseID 是调用方提供的上游响应关联标识。
 	PreviousResponseID string
+	// Store 是调用方是否要求服务端存储本次响应（stateful 语义见
+	// app/stateful.go）。
+	Store bool
 	// ToolNameMap 记录 namespace 展平名到客户端面向名的还原
 	//（"collaboration__spawn_agent" → {"collaboration","spawn_agent"}），
 	// 响应编码器据此把 wire 名改回 codex 按 {namespace,name} 分字段
@@ -167,8 +172,10 @@ func DecodeRequest(data []byte, collectDropped bool) (AdaptedRequest, error) {
 		return AdaptedRequest{}, err
 	}
 	// 空 input 放行进上游只会换回一条上游语义错误——与 chat/anthropic
-	// 两个前端一致，本地 400 让调用方立刻拿到可行动的报错。
-	if len(context.Messages) == 0 {
+	// 两个前端一致，本地 400 让调用方立刻拿到可行动的报错。续链请求
+	//（previous_response_id）例外：OpenAI 允许空增量续链，全量 input
+	// 由 app 层的链路物化补齐。
+	if len(context.Messages) == 0 && request.PreviousResponseID == "" {
 		return AdaptedRequest{}, errors.New("responses request input is required")
 	}
 	// 相邻 assistant 回合先合并（与 chat/anthropic 两面同走 IR 层共享
@@ -185,6 +192,7 @@ func DecodeRequest(data []byte, collectDropped bool) (AdaptedRequest, error) {
 		Options: RequestOptions{
 			Stream:             request.Stream,
 			PreviousResponseID: request.PreviousResponseID,
+			Store:              request.Store,
 			ToolNameMap:        nameMaps.restore,
 		},
 	}, nil

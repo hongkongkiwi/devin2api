@@ -3,7 +3,6 @@ package app
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/WncFht/devin2api/internal/api/anthropic/messages"
 	"github.com/WncFht/devin2api/internal/api/common"
@@ -130,23 +129,15 @@ func (p responsesProtocol) DecodeRequest(data []byte, collectDropped bool) (llm.
 	if err != nil {
 		return llm.RequestMessages{}, protocolOptions{}, err
 	}
-	// HTTP 路径的 stateful 适配在 createCompletion 里先于解码完成：
-	// previous_response_id 的链路被物化成全量 input 后字段即剥离，
-	// 走到这里仍非空说明适配层被绕过（测试直连/内部装配错误）——
-	// 显式拒绝比带病执行便宜。WS 会话在规范化时已剥掉该字段做
-	// 本地合并，不会走到这里。
-	if adapted.Options.PreviousResponseID != "" {
-		return llm.RequestMessages{}, protocolOptions{}, &llm.Failure{
-			Code: "invalid_argument",
-			Message: fmt.Sprintf(
-				"previous_response_id %q requires a server-side response store; this proxy always reports store=false — resend the full conversation input without previous_response_id",
-				adapted.Options.PreviousResponseID),
-		}
-	}
+	// store/previous_response_id 的 stateful 语义（续链物化、未接线拒绝、
+	// 落库）收口在 createCompletion 的适配层（app/stateful.go）：它需要
+	// 存储仓与凭据哈希，协议解码层没有这些依赖，这里只把真值带出。
 	return adapted.Context, protocolOptions{
-		Stream:       adapted.Options.Stream,
-		IncludeUsage: false,
-		ToolNameMap:  adapted.Options.ToolNameMap,
+		Stream:             adapted.Options.Stream,
+		IncludeUsage:       false,
+		ToolNameMap:        adapted.Options.ToolNameMap,
+		Store:              adapted.Options.Store,
+		PreviousResponseID: adapted.Options.PreviousResponseID,
 	}, nil
 }
 

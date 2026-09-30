@@ -954,21 +954,6 @@ func (application *App) createCompletion(
 		return
 	}
 	startRecorder()
-	// stateful Responses 适配先于解码：续链请求在此物化全量 input 并剥
-	// previous_response_id（store 语义登记进 statefulTurn）。01 投影仍记
-	// 客户端原文——02 投影（解码后）才是适配产物。WS 内层请求不参与：
-	// 会话层已做本地合并，api 标签是它的排除标志。
-	originalBody := body
-	var stateful *statefulTurn
-	if _, isResponses := protocol.(responsesProtocol); isResponses && api != "responses-ws" {
-		var status int
-		var err error
-		stateful, body, status, err = application.prepareResponsesStateful(request.Context(), body, requestCredentialHash(request))
-		if err != nil {
-			writeLoggedError(writer, recorder, protocol, &completion, debuglog.ErrStageHTTPDecode, status, err)
-			return
-		}
-	}
 	// collectDropped 门控解码期对请求体的二次全量扫描（顶层未消费字段
 	// 收集）——Dropped 的唯一读者是 02 投影，recorder 为 nil 时纯烧 CPU。
 	messages, options, err := protocol.DecodeRequest(body, recorder != nil)
@@ -978,15 +963,36 @@ func (application *App) createCompletion(
 		// 失败的留证路径仍做有效性判定（body 可能根本不是 JSON）。
 		// 先于 error.json 的 enqueue 序与原实现一致；WriteJSON 参数
 		// 表达式必须外层门控——nil recorder 时投影仍会被求值。
-		recorder.WriteJSON(debuglog.StageHTTPRequest, httpRequestProjection(request, originalBody, err == nil))
+		recorder.WriteJSON(debuglog.StageHTTPRequest, httpRequestProjection(request, body, err == nil))
 	}
 	if err != nil {
 		writeLoggedError(writer, recorder, protocol, &completion, debuglog.ErrStageHTTPDecode, http.StatusBadRequest, err)
 		return
 	}
-	// stateful 回显选项在解码后注入：Store 反映真实落库意图（WS 请求
-	// stateful 为 nil，恒 false），PreviousResponseID 是续链父 id——
-	// 响应对象的这两个字段与存储行为同源，不说谎。
+	// stateful Responses 适配（responses 协议 HTTP 路径）在首次解码后
+	// 进行：options 已带 store/previous_response_id 真值，无 stateful
+	// 字段的请求（绝大多数）零额外解析成本；续链改写后重新解码出全量
+	// 上下文，02 投影记录的是适配后形态（与 WS 会话口径一致）。WS 内层
+	// 请求不参与——会话层已做本地合并，api 标签是它的排除标志。
+	var stateful *statefulTurn
+	if _, isResponses := protocol.(responsesProtocol); isResponses && api != "responses-ws" {
+		turn, rewritten, status, adaptErr := application.adaptResponsesStateful(request.Context(), body, requestCredentialHash(request), options)
+		if adaptErr != nil {
+			writeLoggedError(writer, recorder, protocol, &completion, debuglog.ErrStageHTTPDecode, status, adaptErr)
+			return
+		}
+		if rewritten != nil {
+			messages, options, err = protocol.DecodeRequest(rewritten, recorder != nil)
+			if err != nil {
+				writeLoggedError(writer, recorder, protocol, &completion, debuglog.ErrStageHTTPDecode, http.StatusBadRequest, err)
+				return
+			}
+		}
+		stateful = turn
+	}
+	// 回显选项与存储行为同源：Store 反映真实落库意图（WS 请求 stateful
+	// 为 nil，恒 false），PreviousResponseID 是续链父 id——响应对象的
+	// 这两个字段不说谎。
 	if stateful != nil {
 		options.Store = stateful.store
 		options.PreviousResponseID = stateful.parentID

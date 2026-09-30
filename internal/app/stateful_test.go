@@ -211,6 +211,30 @@ func messageContentBlocks(message llm.Message) []string {
 	return texts
 }
 
+func TestStatefulChainWithEmptyIncrementalInput(t *testing.T) {
+	// OpenAI 允许空增量续链（全量 input 由链路物化补齐）：适配器应看到
+	// 祖先的 user+assistant 两轮。
+	application, fake := newStatefulApp(t, statefulEvents("assistant says hi"))
+	first := postResponses(t, application, "", `{"model":"gpt-test","store":true,"input":"hi there"}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first turn: status %d body %s", first.Code, first.Body.String())
+	}
+	var response struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	fake.events = statefulEvents("continued answer")
+	second := postResponses(t, application, "", `{"model":"gpt-test","store":true,"previous_response_id":"`+response.ID+`"}`)
+	if second.Code != http.StatusOK {
+		t.Fatalf("empty-incremental chain: status %d body %s", second.Code, second.Body.String())
+	}
+	if len(fake.lastRequest.Messages) != 2 {
+		t.Fatalf("adapter should see the 2 ancestor turns, got %d", len(fake.lastRequest.Messages))
+	}
+}
+
 func TestStatefulChainRequiresStoreAndExistingRoot(t *testing.T) {
 	application, _ := newStatefulApp(t, statefulEvents("hi"))
 	// store 缺省 false 时续链显式 400——增量 input 没有可回放的链。
