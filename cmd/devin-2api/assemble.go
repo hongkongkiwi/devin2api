@@ -163,6 +163,9 @@ func assemble(p bootParams) (*assembly, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load model registry failed: %w", err)
 	}
+	// stateful Responses 响应存储：responses 表在刚打开并迁移完的 db 里，
+	// store:true 落库、previous_response_id 续链与取回端点共用同一仓。
+	application.SetResponsesStore(p.db)
 	// 面板与 token 解耦：空 token 时 stats/rejects/日志查询仍是排障入口，
 	// 上游相关调用靠 tokenFunc 现取，凭据补进后自动恢复。
 	// /web、/admin、/dashboard、/public、/login、/logout 挂在根路径。

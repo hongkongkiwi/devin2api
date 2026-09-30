@@ -130,7 +130,7 @@ func TestStreamCompletionUnwindAfterPumpHandoff(t *testing.T) {
 	go func() {
 		defer close(returned)
 		application.streamCompletion(ctx, writer, recorder, chatProtocol{},
-			llm.RequestMessages{Model: "gpt-test"}, protocolOptions{Stream: true}, completion, &responseBytes)
+			llm.RequestMessages{Model: "gpt-test"}, protocolOptions{Stream: true}, completion, &responseBytes, nil)
 	}()
 
 	<-writer.writeEntered // 消费方停在首个 flush 写出

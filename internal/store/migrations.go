@@ -263,6 +263,15 @@ var schemaMigrations = []migration{
 			return nil
 		},
 	},
+	{
+		// responses 是全新表（stateful Responses API 服务端存储）：
+		// 幂等建表路径（schema.go）已覆盖新库与存量库，登记版本同
+		// 0019 先例，取下一空号。
+		version: "0020_responses",
+		apply: func(context.Context, dbtx) error {
+			return nil
+		},
+	},
 }
 
 // migrationLockBudget 是整轮迁移等写锁的墙钟预算：BEGIN IMMEDIATE 在

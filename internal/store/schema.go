@@ -322,6 +322,26 @@ var schemaStatements = []string{
 	// 播种扫描的支点。
 	`CREATE INDEX IF NOT EXISTS idx_detached_blobs_finished ON detached_blobs(finished_at)`,
 
+	// responses：stateful Responses API 的服务端响应存储——store:true
+	// 的响应在完成时把定稿 Response 对象与归一化 input items 落库，
+	// 供 GET /v1/responses/{id} 取回与 previous_response_id 续链物化
+	// （读方见 app/stateful.go）。parent_id 是链上父响应（空表示链首）；
+	// key_hash 隔离租户（下游凭据哈希，跨令牌不可互查/互链）；
+	// status 是 Response 顶层的 status 字段副本（cancel 端点的拒绝
+	// 文案用，免解析整包 JSON）。保留期走 expires_at（PruneExpiredResponses）。
+	`CREATE TABLE IF NOT EXISTS responses (
+		id TEXT PRIMARY KEY,
+		parent_id TEXT NOT NULL DEFAULT '',
+		key_hash TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'completed',
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		input_json BLOB NOT NULL,
+		response_json BLOB NOT NULL
+	)`,
+	// 保留期清理（PruneExpiredResponses 按 expires_at 范围删）的支点。
+	`CREATE INDEX IF NOT EXISTS idx_responses_expires ON responses(expires_at)`,
+
 	// runtime_state：键值小状态。gate:<lane> 存冷却闩 JSON；
 	// import_base_done / debug_dirs_imported 是导入进度标记。
 	`CREATE TABLE IF NOT EXISTS runtime_state (

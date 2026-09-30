@@ -17,6 +17,20 @@ import (
 // SSEEvent 别名共用的事件类型，保留包内引用的可读性。
 type SSEEvent = common.SSEEvent
 
+// ResponseOptions 是响应方向编码需要回显给客户端的请求侧选项。
+type ResponseOptions struct {
+	// ToolNameMap 是 namespace 展平名到客户端面向名的还原表（无展平时 nil）。
+	ToolNameMap map[string]QualifiedToolName
+	// Store 为 true 表示本次响应已被服务端存储（stateful Responses），
+	// Response 对象如实回显 store:true——客户端据此决定下一轮是否
+	// 走 previous_response_id 续链。误报 true 会诱使客户端只发增量
+	// input 而丢光上下文，必须与实际存储行为一致。
+	Store bool
+	// PreviousResponseID 是本次请求续链的父响应 id，回显进 Response
+	// 对象；空表示本次是无父链的独立请求。
+	PreviousResponseID string
+}
+
 // StreamEncoder 保存一次 HTTP Responses 流的协议状态和完整 output items。
 type StreamEncoder struct {
 	// model 是对外 Responses 请求使用的模型标识。
@@ -25,6 +39,9 @@ type StreamEncoder struct {
 	responseID string
 	// createdAt 是 Response 创建时的 Unix 秒时间戳。
 	createdAt int64
+	// store/previousResponseID 是回显进 Response 对象的 stateful 选项。
+	store              bool
+	previousResponseID string
 	// sequenceNumber 是下一个 SSE 事件的连续序号。
 	sequenceNumber int64
 	// items 按中间内容块下标保存正在生成或已经结束的 output item。
@@ -35,6 +52,10 @@ type StreamEncoder struct {
 	started bool
 	// completed 表示终止事件已经发出。
 	completed bool
+	// finalJSON 是 done 时定稿的完整 Response 对象 JSON；仅成功终止
+	// （completed/incomplete）有值——failed 不进存储。供 app 层的
+	// stateful 存储在流结束后原样取走，不必二次拼装。
+	finalJSON []byte
 	// outputIDClaimed 标记上游 outputId 已被首个 message item 领走：
 	// item id 在一次响应内必须唯一，后续 message 块用合成的 msg_。
 	outputIDClaimed bool
@@ -70,26 +91,32 @@ type streamItem struct {
 }
 
 // NewStreamEncoder 为一次 HTTP Responses 请求创建独立的 SSE 编码状态。
-// toolNameMap 是 namespace 展平名到客户端面向名的还原表（无展平时传 nil）。
-func NewStreamEncoder(model string, toolNameMap map[string]QualifiedToolName) *StreamEncoder {
+func NewStreamEncoder(model string, options ResponseOptions) *StreamEncoder {
 	return &StreamEncoder{
-		model:       model,
-		responseID:  randid.Prefixed("resp_"),
-		createdAt:   time.Now().Unix(),
-		items:       make(map[int]*streamItem),
-		toolNameMap: toolNameMap,
+		model:              model,
+		responseID:         randid.Prefixed("resp_"),
+		createdAt:          time.Now().Unix(),
+		items:              make(map[int]*streamItem),
+		store:              options.Store,
+		previousResponseID: options.PreviousResponseID,
+		toolNameMap:        options.ToolNameMap,
 	}
+}
+
+// CompletedResponseJSON 返回流终帧定稿的完整 Response 对象 JSON；
+// 第二个返回值为 false 表示流未成功终止（中途失败/尚未结束），无对象可取。
+func (encoder *StreamEncoder) CompletedResponseJSON() ([]byte, bool) {
+	return encoder.finalJSON, encoder.finalJSON != nil
 }
 
 // EncodeResponse 将最终助手消息编码为非流式 Responses JSON 响应。
 // model 是回显给客户端的模型名（请求原文，可能是别名）；为空时
 // 回落到上游声明的 actual uid 再到解析后的请求 uid。
-// toolNameMap 与 NewStreamEncoder 同源。
-func EncodeResponse(message *llm.AssistantMessage, model string, toolNameMap map[string]QualifiedToolName) ([]byte, error) {
+func EncodeResponse(message *llm.AssistantMessage, model string, options ResponseOptions) ([]byte, error) {
 	if message == nil {
 		return nil, fmt.Errorf("response message is nil")
 	}
-	output, err := outputFromMessage(message, toolNameMap)
+	output, err := outputFromMessage(message, options.ToolNameMap)
 	if err != nil {
 		return nil, err
 	}
@@ -107,9 +134,19 @@ func EncodeResponse(message *llm.AssistantMessage, model string, toolNameMap map
 	if status == "completed" {
 		response["completed_at"] = time.Now().Unix()
 	}
+	applyStatefulFields(response, options.Store, options.PreviousResponseID)
 	response["output"] = output
 	response["usage"] = responseUsage(message.Usage)
 	return json.Marshal(response)
+}
+
+// applyStatefulFields 把 stateful 存储选项回显进 Response 对象：
+// store 如实反映服务端是否存储，previous_response_id 回显续链父 id。
+func applyStatefulFields(response map[string]any, store bool, previousResponseID string) {
+	response["store"] = store
+	if previousResponseID != "" {
+		response["previous_response_id"] = previousResponseID
+	}
 }
 
 // Encode 将一个中间响应事件展开为零个或多个有序 Responses SSE 事件。
@@ -176,6 +213,7 @@ func (encoder *StreamEncoder) start() []SSEEvent {
 	}
 	encoder.started = true
 	created := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "in_progress")
+	applyStatefulFields(created, encoder.store, encoder.previousResponseID)
 	return []SSEEvent{
 		encoder.emit("response.created", map[string]any{"response": created}),
 		encoder.emit("response.in_progress", map[string]any{"response": created}),
@@ -563,6 +601,7 @@ func (encoder *StreamEncoder) done(event llm.ResponseEvent) ([]SSEEvent, error) 
 	}
 	encoder.completed = true
 	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, responseStatus(event.Reason))
+	applyStatefulFields(response, encoder.store, encoder.previousResponseID)
 	response["output"] = encoder.completedOutput()
 	response["usage"] = responseUsage(event.Message.Usage)
 	eventName := "response.completed"
@@ -575,6 +614,11 @@ func (encoder *StreamEncoder) done(event llm.ResponseEvent) ([]SSEEvent, error) 
 		response["incomplete_details"] = map[string]any{"reason": reason}
 	} else {
 		response["completed_at"] = time.Now().Unix()
+	}
+	// 终帧 payload 里就是完整 Response 对象；marshal 一份留作 stateful
+	// 存储的取用源（CompletedResponseJSON），与下发同源不重拼。
+	if finalJSON, err := json.Marshal(response); err == nil {
+		encoder.finalJSON = finalJSON
 	}
 	return []SSEEvent{encoder.emit(eventName, map[string]any{"response": response})}, nil
 }
@@ -590,6 +634,7 @@ func (encoder *StreamEncoder) failed(event llm.ResponseEvent) []SSEEvent {
 	// 排障位置同事实源），debug_ref 等排障字段两处一致。
 	errorPayload, status := common.StreamErrorOpenAI(event, "response stream failed")
 	response := baseResponse(encoder.responseID, encoder.model, encoder.createdAt, "failed")
+	applyStatefulFields(response, encoder.store, encoder.previousResponseID)
 	response["error"] = errorPayload
 	// 挂起的 reasoning item 先补发收尾再下发失败事件，与 Done 路径一致——
 	// 否则等待尾随签名的 item 会悬空在 output 之外。

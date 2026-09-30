@@ -42,6 +42,8 @@
 - `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS` / `CLAUDE_STREAM_IDLE_TIMEOUT_MS`：首字节与流内空闲看门狗毫秒数（钳位区间 10s–30min）。上游长 thinking 场景把首字节显式放宽到 300000——CC 对第一方 provider 档的默认首字节窗口只有 180s。
 - `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`（不必设）：只影响按真实 `api.anthropic.com` 判定的功能门（Remote Control 资格、gateway discovery 提示等），与重试参数档无关——旧版文档把它记成"重试上限 10→300"是张冠李戴，那其实是 watchdog 的默认值。
 
+- **count_tokens**：`POST /v1/messages/count_tokens` 已实现为本地估算（文本与工具声明按 bytes/4 口径、媒体块按固定值粗估），不触上游、不产生上游计费；结果是容量参考值，与上游计费口径存在偏差。CC 在端点缺席时会退回本地估算，本端点让它拿到一致的预检值。
+
 ## pi
 
 `~/.pi/agent/models.json`:
@@ -127,6 +129,10 @@ base_url = "http://127.0.0.1:3033/v1"
 Codex 走 OpenAI Responses 面 (`POST /v1/responses`),直连与经 ccload 转发均可。`apply_patch` 是 `type:"custom"` 工具调用（0.154.0 起经代理包装过境，实测补丁落盘；更早版本走 `exec_command` shell 兜底），无兼容问题。`model_context_window`/`model_auto_compact_token_limit` 必须按真实窗口 262000 配——默认/错配的更大值会让 auto-compact 阈值落在上限之外，超限请求直接失败而不是先压缩（已实测验证：240k 历史 resume 触发 `context compacted`）。
 
 上游限流（429）对 Codex 只经流内错误事件重试——codex-rs 对 HTTP 429 一律终止（`retry_429` 硬编码 false），代理已把 pre-stream 429 转成 `response.failed` 事件下发，Codex 按事件里的 `try again in Ns` 睡到解闩再续。默认 `stream_max_retries = 5` 大约只覆盖不到一分钟的限流窗口；常见的一分钟桶限流建议在 `[model_providers.OpenAI]` 块内加一行 `stream_max_retries = 100`（上限 100）。
+
+### stateful Responses（store / previous_response_id）
+
+`POST /v1/responses` 支持 OpenAI 的 stateful 形态：请求带 `store:true` 时响应在完成后落服务端存储（`responses` 表，保留 30 天，超期由养护循环清理），响应对象如实回显 `store:true`；带 `previous_response_id` 的增量请求由代理沿 `parent_id` 链物化成「祖先 input+output 全量 + 本次增量」再上行，客户端照常只发增量 input。取回面：`GET /v1/responses/{id}` 原样回放定稿对象、`GET /v1/responses/{id}/input_items` 回放该轮增量 input、`DELETE /v1/responses/{id}` 删除（子链引用不级联，祖先缺失的链在续链时 404）；`POST /v1/responses/{id}/cancel` 对已完结响应按 OpenAI 语义 400（本代理只在响应完成后落库，无进行中行可取消）。存储按下游令牌哈希隔离，跨 key 不可互查、不可互链；`previous_response_id` 必须搭配 `store:true`（store 缺省 false，与历史 store=false 声明一致，无存储意图的客户端不受影响）；WS 链路（responses-ws）有自己的会话合并，不落此存储、行为不变。
 
 ### Codex WebSocket 链路（可选）
 

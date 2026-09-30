@@ -494,6 +494,11 @@ func (s *Store) Maintain(ctx context.Context, logRowDays int64) error {
 	if _, err := s.PruneDetachedBlobs(ctx, time.Now().Add(-detachedBlobRetention).UnixMilli()); err != nil {
 		errs = append(errs, err)
 	}
+	// stateful Responses 存储同理按自有 TTL（ResponseTTL，写侧逐行钉
+	// expires_at）清理，不随 logRowDays 走。
+	if _, err := s.PruneExpiredResponses(ctx, time.Now().UnixMilli()); err != nil {
+		errs = append(errs, err)
+	}
 	// CAS 的 mark-sweep 放养护而不放淘汰路径：对象是表不是目录，
 	// 且必须先于 vacuum 跑，孤儿页才能进 freelist 被当轮回收。
 	if err := s.ReapOrphanBlobs(ctx); err != nil {

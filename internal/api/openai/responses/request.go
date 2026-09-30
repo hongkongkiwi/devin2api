@@ -49,15 +49,18 @@ type Request struct {
 }
 
 // responsesRequestFields 是 DecodeRequest 已消费的顶层字段；其余字段
-// （reasoning/store/service_tier/include 等）上游没有对应物，
-// 记入 Dropped 透出而不是静默吞掉。previous_response_id 虽被消费
-// 用于显式拒绝，标记为已读避免空值也落进 dropped。
+// （reasoning/service_tier/include 等）上游没有对应物，记入 Dropped
+// 透出而不是静默吞掉。previous_response_id 由 app 层 stateful 适配在
+// 解码前消费（续链改写为全量 input 后剥离，见 app/stateful.go）；store
+// 同样在 app 层消费——响应是否落存储由 app 决定，本层只标记已读避免
+// 落进 dropped。
 var responsesRequestFields = map[string]bool{
 	"model": true, "instructions": true, "input": true, "tools": true,
 	"stream": true, "max_output_tokens": true, "temperature": true,
 	"top_p": true, "user": true, "prompt_cache_key": true,
 	"tool_choice": true, "parallel_tool_calls": true,
 	"previous_response_id": true,
+	"store":                true,
 }
 
 // Tool 是 OpenAI Responses 工具定义；type 支持 function、custom（freeform）、

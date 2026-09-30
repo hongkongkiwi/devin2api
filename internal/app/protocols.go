@@ -113,6 +113,13 @@ type protocolOptions struct {
 	// ToolNameMap 是 namespace 展平名到客户端面向名的还原表
 	//（responses 侧 {ns}__{sub} → {namespace,name} 分字段）；其余协议恒为空。
 	ToolNameMap map[string]responses.QualifiedToolName
+	// Store/PreviousResponseID 是 stateful Responses 的回显选项（仅
+	// responses 协议消费）：store 反映服务端是否存储了本次响应，
+	// PreviousResponseID 是续链父 id。由 createCompletion 按 stateful
+	// 适配的结果覆写——DecodeRequest 从请求体拿不到它们（字段在解码前
+	// 已被剥除/无存储语义），其余协议恒为零值。
+	Store              bool
+	PreviousResponseID string
 }
 
 // responsesProtocol 实现 OpenAI Responses API 协议。
@@ -123,8 +130,9 @@ func (p responsesProtocol) DecodeRequest(data []byte, collectDropped bool) (llm.
 	if err != nil {
 		return llm.RequestMessages{}, protocolOptions{}, err
 	}
-	// HTTP 路径无响应存储（store=false 已如实声明），previous_response_id
-	// 意味着客户端只发了增量 input——静默当全量会把上下文丢光，
+	// HTTP 路径的 stateful 适配在 createCompletion 里先于解码完成：
+	// previous_response_id 的链路被物化成全量 input 后字段即剥离，
+	// 走到这里仍非空说明适配层被绕过（测试直连/内部装配错误）——
 	// 显式拒绝比带病执行便宜。WS 会话在规范化时已剥掉该字段做
 	// 本地合并，不会走到这里。
 	if adapted.Options.PreviousResponseID != "" {
@@ -143,11 +151,19 @@ func (p responsesProtocol) DecodeRequest(data []byte, collectDropped bool) (llm.
 }
 
 func (p responsesProtocol) NewStreamEncoder(model string, options protocolOptions) streamEncoder {
-	return responses.NewStreamEncoder(model, options.ToolNameMap)
+	return responses.NewStreamEncoder(model, responses.ResponseOptions{
+		ToolNameMap:        options.ToolNameMap,
+		Store:              options.Store,
+		PreviousResponseID: options.PreviousResponseID,
+	})
 }
 
 func (p responsesProtocol) EncodeFinal(message *llm.AssistantMessage, model string, options protocolOptions) ([]byte, error) {
-	return responses.EncodeResponse(message, model, options.ToolNameMap)
+	return responses.EncodeResponse(message, model, responses.ResponseOptions{
+		ToolNameMap:        options.ToolNameMap,
+		Store:              options.Store,
+		PreviousResponseID: options.PreviousResponseID,
+	})
 }
 
 func (p responsesProtocol) EncodeError(err error, debugRef string) []byte {

@@ -335,6 +335,7 @@ func (application *App) streamCompletion(
 	options protocolOptions,
 	completion *debuglog.Completion,
 	responseBytes *int,
+	stateful *statefulTurn,
 ) {
 	if _, ok := writer.(http.Flusher); !ok {
 		writeLoggedError(writer, recorder, protocol, completion, debuglog.ErrStageHTTPStream, http.StatusInternalServerError, errors.New("streaming response writer does not support flushing"))
@@ -431,9 +432,14 @@ func (application *App) streamCompletion(
 	completion.StatusCode = http.StatusOK
 	// 回显客户端原始请求名而非 redirect 后的内部名（RequestedModel 在
 	// 注册表改写前采样）——客户端不能看到自己没请求的模型名。
-	message, streamErr := writeProtocolStream(streamCtx, out, items, ticker, recorder, protocol, strings.TrimSpace(completion.RequestedModel), options, prelude, firstErr)
+	message, completedJSON, streamErr := writeProtocolStream(streamCtx, out, items, ticker, recorder, protocol, strings.TrimSpace(completion.RequestedModel), options, prelude, firstErr)
 	updateCompletionIdentity(completion, messages, message)
 	*responseBytes += out.bytes
+	// stateful 流式：流成功终止时 writeProtocolStream 已从编码器取走
+	// 定稿 Response 对象，回填给完成后的落库。
+	if streamErr == nil && stateful != nil && stateful.store {
+		stateful.responseJSON = completedJSON
+	}
 	if streamErr != nil {
 		streamFailure := llm.Classify(streamErr)
 		noteRetryAfter(recorder, streamFailure)
@@ -461,6 +467,8 @@ func (application *App) streamCompletion(
 	completion.Result = "completed"
 }
 
+// 返回值 completedJSON 是流成功终止时从编码器取走的定稿 Response 对象
+// （仅 responses 协议的 stateful 存储消费；其余编码器恒 nil）。
 func writeProtocolStream(
 	ctx context.Context,
 	out *streamWriter,
@@ -472,7 +480,7 @@ func writeProtocolStream(
 	options protocolOptions,
 	prelude []llm.ResponseEvent,
 	preludeErr error,
-) (*llm.AssistantMessage, error) {
+) (*llm.AssistantMessage, []byte, error) {
 	encoder := protocol.NewStreamEncoder(model, options)
 	// WS 写出方按事件下沉：SSEEvent 直交 sink，省掉文本渲染与回解往返；
 	// HTTP 写出方不实现该接口，事件照常并入 SSE 批次。
@@ -506,7 +514,7 @@ func writeProtocolStream(
 			// 突发流量摊薄 syscall。
 			if len(batch) >= streamBatchFlushBytes {
 				if wErr := flush(); wErr != nil {
-					return latest, wErr
+					return latest, nil, wErr
 				}
 				continue
 			}
@@ -519,7 +527,7 @@ func writeProtocolStream(
 				}
 			default:
 				if wErr := flush(); wErr != nil {
-					return latest, wErr
+					return latest, nil, wErr
 				}
 				continue
 			}
@@ -532,32 +540,32 @@ func writeProtocolStream(
 		// 接收 select 在两路就绪时随机选，不查 ctx 会把断连随机记成
 		// completed/failed/disconnected。
 		if ctx.Err() != nil {
-			return latest, context.Cause(ctx)
+			return latest, nil, context.Cause(ctx)
 		}
 		if errors.Is(err, io.EOF) {
 			if wErr := flush(); wErr != nil {
-				return latest, wErr
+				return latest, nil, wErr
 			}
-			return latest, nil
+			return latest, completedEncoderResponse(encoder), nil
 		}
 		if err != nil {
 			if wErr := flush(); wErr != nil {
-				return latest, wErr
+				return latest, nil, wErr
 			}
-			return latest, err
+			return latest, nil, err
 		}
 		latest = eventMessage(event, latest)
 		encodedEvents, encodeErr := encoder.Encode(event)
 		if encodeErr != nil {
 			if wErr := flush(); wErr != nil {
-				return latest, wErr
+				return latest, nil, wErr
 			}
-			return latest, encodeErr
+			return latest, nil, encodeErr
 		}
 		for _, encoded := range encodedEvents {
 			if sink != nil {
 				if err := out.writeEvent(sink, encoded.Name, encoded.Data); err != nil {
-					return latest, err
+					return latest, nil, err
 				}
 			} else {
 				batch = protocol.AppendSSE(batch, encoded.Name, encoded.Data)
@@ -571,16 +579,27 @@ func writeProtocolStream(
 		if event.Type == llm.ResponseEventError {
 			// 错误 SSE 已进批次，先落盘再返回错误供外层记录失败日志。
 			if wErr := flush(); wErr != nil {
-				return latest, wErr
+				return latest, nil, wErr
 			}
 			// 分类记录随车返回——Cause 链（context.Canceled 等）与
 			// 生产侧结构字段不再经文本重推。
 			if failure := llm.FailureOf(event.Error); failure.Error() != "" {
-				return latest, failure
+				return latest, nil, failure
 			}
-			return latest, errors.New("response stream returned an error event")
+			return latest, nil, errors.New("response stream returned an error event")
 		}
 	}
+}
+
+// completedEncoderResponse 从支持终帧取用的编码器（responses 协议）拿
+// 流终止时定稿的完整 Response 对象；其余编码器没有该能力，返回 nil。
+func completedEncoderResponse(encoder streamEncoder) []byte {
+	if source, ok := encoder.(interface{ CompletedResponseJSON() ([]byte, bool) }); ok {
+		if data, ok := source.CompletedResponseJSON(); ok {
+			return data
+		}
+	}
+	return nil
 }
 
 // collectPumpedMessage 从泵 channel 收集非流式最终消息。等待期间按

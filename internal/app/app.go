@@ -35,6 +35,7 @@ import (
 	"github.com/WncFht/devin2api/internal/modelreg"
 	"github.com/WncFht/devin2api/internal/obs"
 	"github.com/WncFht/devin2api/internal/randid"
+	"github.com/WncFht/devin2api/internal/store"
 )
 
 // PanelRegistrar 描述面板路由注册所需的最小能力。
@@ -80,6 +81,10 @@ type App struct {
 	// models 是模型注册表覆盖层（停用开关与重定向）；nil 表示无注册表，
 	// 模型名直通 adapter 别名解析。
 	models *modelreg.Store
+	// responsesStore 是 stateful Responses 的服务端响应存储（store:true
+	// 落库、previous_response_id 续链、取回端点）；nil 表示未接线（测试
+	// 装配），stateful 语义退回 store=false 口径（续链 400 拒绝）。
+	responsesStore *store.Store
 	// tokenCostFn 把一次请求的 token 用量折成美元（目录价口径），
 	// 供 token 费用窗口记账；nil 时成本记 0。
 	tokenCostFn func(model string, input, output, cacheRead, cacheWrite int64) float64
@@ -173,6 +178,11 @@ func (application *App) SetModelRegistry(models *modelreg.Store) {
 	application.models = models
 }
 
+// SetResponsesStore 注入 stateful Responses 响应存储；应在 Router 之前调用。
+func (application *App) SetResponsesStore(responsesStore *store.Store) {
+	application.responsesStore = responsesStore
+}
+
 // SetCCPanel 注入管理面板（ccLoad 契约）处理器。
 func (application *App) SetCCPanel(d PanelRegistrar) {
 	application.ccPanel = d
@@ -240,6 +250,13 @@ func (application *App) Router() http.Handler {
 		// 失败冷却自保。
 		protected.Get("/v1/models", application.listModels)
 		protected.Get("/v1/models/{model}", application.getModel)
+		// stateful Responses 取回面与 Anthropic count_tokens：元数据级
+		// 读写，不触上游，不占并发槽（同 /v1/models 口径）。
+		protected.Get("/v1/responses/{responseID}", application.getStoredResponse)
+		protected.Delete("/v1/responses/{responseID}", application.deleteStoredResponse)
+		protected.Post("/v1/responses/{responseID}/cancel", application.cancelStoredResponse)
+		protected.Get("/v1/responses/{responseID}/input_items", application.listResponseInputItems)
+		protected.Post("/v1/messages/count_tokens", application.countTokens)
 		// chi 不允许在同一 mux 上先注册路由再 Use——并发闸门单独开一组，
 		// 组内 Use 先于路由注册，组外的 models/WS 不受它约束。
 		// 协议路由由 v1Routes 表驱动注册：信封/归因/注册同源。
@@ -937,6 +954,21 @@ func (application *App) createCompletion(
 		return
 	}
 	startRecorder()
+	// stateful Responses 适配先于解码：续链请求在此物化全量 input 并剥
+	// previous_response_id（store 语义登记进 statefulTurn）。01 投影仍记
+	// 客户端原文——02 投影（解码后）才是适配产物。WS 内层请求不参与：
+	// 会话层已做本地合并，api 标签是它的排除标志。
+	originalBody := body
+	var stateful *statefulTurn
+	if _, isResponses := protocol.(responsesProtocol); isResponses && api != "responses-ws" {
+		var status int
+		var err error
+		stateful, body, status, err = application.prepareResponsesStateful(request.Context(), body, requestCredentialHash(request))
+		if err != nil {
+			writeLoggedError(writer, recorder, protocol, &completion, debuglog.ErrStageHTTPDecode, status, err)
+			return
+		}
+	}
 	// collectDropped 门控解码期对请求体的二次全量扫描（顶层未消费字段
 	// 收集）——Dropped 的唯一读者是 02 投影，recorder 为 nil 时纯烧 CPU。
 	messages, options, err := protocol.DecodeRequest(body, recorder != nil)
@@ -946,11 +978,18 @@ func (application *App) createCompletion(
 		// 失败的留证路径仍做有效性判定（body 可能根本不是 JSON）。
 		// 先于 error.json 的 enqueue 序与原实现一致；WriteJSON 参数
 		// 表达式必须外层门控——nil recorder 时投影仍会被求值。
-		recorder.WriteJSON(debuglog.StageHTTPRequest, httpRequestProjection(request, body, err == nil))
+		recorder.WriteJSON(debuglog.StageHTTPRequest, httpRequestProjection(request, originalBody, err == nil))
 	}
 	if err != nil {
 		writeLoggedError(writer, recorder, protocol, &completion, debuglog.ErrStageHTTPDecode, http.StatusBadRequest, err)
 		return
+	}
+	// stateful 回显选项在解码后注入：Store 反映真实落库意图（WS 请求
+	// stateful 为 nil，恒 false），PreviousResponseID 是续链父 id——
+	// 响应对象的这两个字段与存储行为同源，不说谎。
+	if stateful != nil {
+		options.Store = stateful.store
+		options.PreviousResponseID = stateful.parentID
 	}
 	// 显式亲和头恒赢于 body 提取的 SessionKey：头是调用方的意图声明，
 	// 号池会话绑定与 trajectory 谱系都以它为种子。
@@ -1048,7 +1087,8 @@ func (application *App) createCompletion(
 	}
 	ctx := debuglog.WithRecorder(reqCtx, recorder)
 	if options.Stream {
-		application.streamCompletion(ctx, writer, recorder, protocol, messages, options, &completion, &responseBytes)
+		application.streamCompletion(ctx, writer, recorder, protocol, messages, options, &completion, &responseBytes, stateful)
+		application.persistStateful(request.Context(), stateful)
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
@@ -1109,6 +1149,11 @@ func (application *App) createCompletion(
 	recorder.AppendJSONL(debuglog.StageHTTPResponse, "response", json.RawMessage(body))
 	completion.StatusCode = http.StatusOK
 	completion.Result = "completed"
+	// 非流式 stateful：EncodeFinal 产物即定稿 Response 对象，回填落库。
+	if stateful != nil {
+		stateful.responseJSON = body
+		application.persistStateful(request.Context(), stateful)
+	}
 }
 
 func updateCompletionIdentity(completion *debuglog.Completion, messages llm.RequestMessages, message *llm.AssistantMessage) {
