@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -128,16 +129,23 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 			}
 			// credentials_content 是粘贴上传：先证明能解出 token 再落盘
 			// 到状态目录管理位，行存绝对路径。落盘先于干跑——合成校验
-			// 要按 credentials_file 口径重读它；后续步骤失败留下的是
-			// 未被引用的文件，惰性无害。
+			// 要按 credentials_file 口径重读它；后续步骤被拒时按写前
+			// 快照还原，不留孤儿文件。
+			var undoCredentials func()
+			defer func() {
+				if undoCredentials != nil {
+					undoCredentials()
+				}
+			}()
 			if in.CredentialsContent != "" {
 				if config.TokenFromCredentialsContent([]byte(in.CredentialsContent)) == "" {
 					return nil, errors.New("credentials_content carries no windsurf_api_key")
 				}
-				path, err := writeAccountCredentialsFile(rt.stateDir, in.Name, in.CredentialsContent)
+				path, undo, err := writeAccountCredentialsFile(rt.stateDir, in.Name, in.CredentialsContent)
 				if err != nil {
 					return nil, fmt.Errorf("write credentials_content: %w", err)
 				}
+				undoCredentials = undo
 				row.CredentialsFile = path
 			}
 			// 干跑整表校验先于行写入：合成集非法（零凭据/重名/重
@@ -166,6 +174,7 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 				rollbackAccountRow(ctx, rt.db, in.Name, nil)
 				return nil, err
 			}
+			undoCredentials = nil
 			return findResolved(resolved, in.Name), nil
 		},
 		Update: func(ctx context.Context, name string, patch AccountPatch) (*store.ResolvedAccount, error) {
@@ -214,7 +223,13 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 			}
 			// credentials_content 同 Create：显式空串清 credentials_file
 			// 覆盖（不落盘），非空先验 token 再写管理位。落盘先于干跑，
-			// 失败残留的孤儿文件惰性无害。
+			// 被拒时按写前快照还原——已有账号的文件正被 lane 实时重读。
+			var undoCredentials func()
+			defer func() {
+				if undoCredentials != nil {
+					undoCredentials()
+				}
+			}()
 			if patch.CredentialsContent != nil {
 				if *patch.CredentialsContent == "" {
 					row.CredentialsFile = ""
@@ -222,10 +237,11 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 					if config.TokenFromCredentialsContent([]byte(*patch.CredentialsContent)) == "" {
 						return nil, errors.New("credentials_content carries no windsurf_api_key")
 					}
-					path, err := writeAccountCredentialsFile(rt.stateDir, name, *patch.CredentialsContent)
+					path, undo, err := writeAccountCredentialsFile(rt.stateDir, name, *patch.CredentialsContent)
 					if err != nil {
 						return nil, fmt.Errorf("write credentials_content: %w", err)
 					}
+					undoCredentials = undo
 					row.CredentialsFile = path
 				}
 			}
@@ -248,6 +264,7 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 				rollbackAccountRow(ctx, rt.db, name, oldRow)
 				return nil, err
 			}
+			undoCredentials = nil
 			return findResolved(resolved, name), nil
 		},
 		Delete: func(ctx context.Context, name string) (*store.ResolvedAccount, error) {
@@ -336,6 +353,18 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 			}
 			candidate := append([]*store.AccountRow(nil), rows...)
 			var staged []*store.AccountRow
+			// 每个粘贴文件都持独立还原权，被拒时按写入逆序回滚（同名
+			// 重复条目下后写的还原权先执行，逐层剥回最原始字节）。
+			var undoCredentials []func()
+			importCommitted := false
+			defer func() {
+				if importCommitted {
+					return
+				}
+				for i := len(undoCredentials) - 1; i >= 0; i-- {
+					undoCredentials[i]()
+				}
+			}()
 			for _, in := range entries {
 				row := &store.AccountRow{
 					Name:            in.Name,
@@ -354,15 +383,16 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 					row.CreatedAt = old.CreatedAt
 				}
 				// credentials_content 同 Create：先证明能解出 token 再落盘
-				// 管理位；失败残留的孤儿文件惰性无害。
+				// 管理位；整批被拒时按写前快照逐文件还原。
 				if in.CredentialsContent != "" {
 					if config.TokenFromCredentialsContent([]byte(in.CredentialsContent)) == "" {
 						return nil, fmt.Errorf("account %q: credentials_content carries no windsurf_api_key", in.Name)
 					}
-					path, err := writeAccountCredentialsFile(rt.stateDir, in.Name, in.CredentialsContent)
+					path, undo, err := writeAccountCredentialsFile(rt.stateDir, in.Name, in.CredentialsContent)
 					if err != nil {
 						return nil, fmt.Errorf("write credentials_content for %q: %w", in.Name, err)
 					}
+					undoCredentials = append(undoCredentials, undo)
 					row.CredentialsFile = path
 				}
 				candidate = replaceAccountRow(candidate, row)
@@ -398,6 +428,7 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 				}
 				return nil, err
 			}
+			importCommitted = true
 			var touched []store.ResolvedAccount
 			for _, row := range staged {
 				if acc := findResolved(resolved, row.Name); acc != nil {
@@ -457,17 +488,32 @@ func (rt *Runtime) Ops(replaySettings func() error) AccountOps {
 // writeAccountCredentialsFile 把粘贴的 credentials.toml 落进状态目录
 // 的 account-credentials/<name>.toml（0600 凭据件、0700 目录）；
 // name 已过账号名正则，路径无注入面。返回绝对路径供行 CredentialsFile
-// 置位。同名的覆盖写语义顺带给 Update 复用（改内容=改文件）。
-func writeAccountCredentialsFile(stateDir, name, content string) (string, error) {
+// 置位，连同写前快照的还原函数：已有账号的 lane 按此路径逐次实时重读
+// 文件，写入后任何一步（干跑/行写入/重推）被拒都必须还原旧字节，否则
+// 被拒的新凭据会在错误返回后立即生效。调用方在全部后续步骤成功前不得
+// 放弃还原权。同名的覆盖写语义顺带给 Update 复用（改内容=改文件）。
+func writeAccountCredentialsFile(stateDir, name, content string) (string, func(), error) {
 	dir := filepath.Join(stateDir, "account-credentials")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	path := filepath.Join(dir, name+".toml")
-	if err := config.WriteFileAtomic(path, []byte(content), 0o600); err != nil {
-		return "", err
+	previous, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", nil, err
 	}
-	return path, nil
+	existed := err == nil
+	if err := config.WriteFileAtomic(path, []byte(content), 0o600); err != nil {
+		return "", nil, err
+	}
+	undo := func() {
+		if existed {
+			_ = config.WriteFileAtomic(path, previous, 0o600)
+		} else {
+			_ = os.Remove(path)
+		}
+	}
+	return path, undo, nil
 }
 
 // findAccountRow 按名找库行（含墓碑）；无行返回 nil。

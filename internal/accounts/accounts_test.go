@@ -542,6 +542,44 @@ func TestAccountOpsCredentialsContent(t *testing.T) {
 	}
 }
 
+// TestUpdateCredentialsContentRollbackKeepsOldFile 验证被拒的 Update 不换
+// 已生效的凭据文件：credentials_content 落盘先于干跑，干跑整单拒绝后
+// 必须还原写前字节——已有账号的 lane 按管理位路径逐次实时重读文件，
+// 不还原则被拒的新凭据在 400 返回后立即生效。
+func TestUpdateCredentialsContentRollbackKeepsOldFile(t *testing.T) {
+	dir := t.TempDir()
+	configPath, cfg := writeTestConfig(t, dir, testAccountsYAML)
+	dbStore := testAccountStore(t, dir)
+	ctx := context.Background()
+	rt := New(configPath, dir, dbStore, testPool(t))
+	rt.CommitConfig(cfg)
+	ops := rt.Ops(nil)
+
+	original := "windsurf_api_key = \"tok-old\"\n"
+	if _, err := ops.Create(ctx, AccountWrite{Name: "cc", CredentialsContent: original}); err != nil {
+		t.Fatal(err)
+	}
+	lit := "tok-dd"
+	if _, err := ops.Create(ctx, AccountWrite{Name: "dd", Token: lit}); err != nil {
+		t.Fatal(err)
+	}
+	// 新凭据 + 与 dd 重复的字面量 token（字面量在合成校验中优先于
+	// 文件解出值）：干跑按重 token 整单拒绝。
+	replacement := "windsurf_api_key = \"tok-new\"\n"
+	dup := lit
+	if _, err := ops.Update(ctx, "cc", AccountPatch{Token: &dup, CredentialsContent: &replacement}); err == nil {
+		t.Fatal("update with duplicate token should fail")
+	}
+	managed := filepath.Join(dir, "account-credentials", "cc.toml")
+	data, err := os.ReadFile(managed)
+	if err != nil || string(data) != original {
+		t.Fatalf("failed update must keep old credentials file, got %q, %v", data, err)
+	}
+	if token, err := ops.TokenOf(ctx, "cc"); err != nil || token != "tok-old" {
+		t.Fatalf("TokenOf(cc) after failed update = %q, %v", token, err)
+	}
+}
+
 // TestCommitCachedConfigView 钉住兜底服役的自省透出：文件缺席时 mtime
 // 比对退化成 stale=false，servedFromCache 标记必须强制 stale 并给
 // served_from/cached_at——「生效配置 ≠ 当前文件」是 stale 的本义。
