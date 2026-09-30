@@ -1038,6 +1038,24 @@ func TestBuildRequestForwardsSamplingParams(t *testing.T) {
 	}
 }
 
+// 上游对部分模型（如 glm-5-2）的精确 temperature=0 回 invalid_argument
+// （CaiJingLong/devin-gateway 实测同类行为），0 必须在投影时抬到 0.01。
+func TestBuildRequestClampsZeroTemperature(t *testing.T) {
+	zero := 0.0
+	request := llm.RequestMessages{
+		SystemPrompt: "system",
+		Temperature:  &zero,
+		Messages:     []llm.Message{llm.UserMessage{Content: []llm.Content{llm.TextContent{Text: "hi"}}}},
+	}
+	converted, _, err := buildRequest(request, Config{}, callBinding{Token: "token", Model: "model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := converted.GetConfiguration().GetTemperature(); got != 0.01 {
+		t.Fatalf("temperature 0 must clamp to 0.01, got %v", got)
+	}
+}
+
 func TestBuildRequestDefaultSamplingParams(t *testing.T) {
 	request := llm.RequestMessages{
 		SystemPrompt: "system",

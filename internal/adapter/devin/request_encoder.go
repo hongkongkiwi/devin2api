@@ -90,7 +90,13 @@ func buildRequestSeeded(request llm.RequestMessages, config Config, binding call
 		completion.MaxTokens = proto.Uint64(uint64(*request.MaxTokens))
 	}
 	if request.Temperature != nil {
-		completion.Temperature = request.Temperature
+		// 上游对部分模型把精确 0 判 invalid_argument（glm-5-2 实测），
+		// 投影时抬到最小可用值，其余原样透传。
+		temperature := *request.Temperature
+		if temperature == 0 {
+			temperature = 0.01
+		}
+		completion.Temperature = proto.Float64(temperature)
 	}
 	if request.TopP != nil {
 		completion.TopP = request.TopP
