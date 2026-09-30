@@ -560,6 +560,14 @@ func writeProtocolStream(
 			if wErr := flush(); wErr != nil {
 				return latest, nil, wErr
 			}
+			// 合法事件被编码器拒绝（如内容索引错序）：200 已提交的流
+			// 合成协议内的错误终结帧尽力下发并落调试记录再收口，客户端
+			// 见到原因而非无声截断；未提交的流保持真实状态码路径
+			// （writeLoggedError），不能先吐错误帧再改写状态头。终帧
+			// 编码/写出再失败也只降级回截断，不掩盖原编码错误。
+			if out.committed {
+				out.writeEncoderFailure(recorder, protocol, encoder, latest, encodeErr)
+			}
 			return latest, nil, encodeErr
 		}
 		for _, encoded := range encodedEvents {
@@ -600,6 +608,45 @@ func completedEncoderResponse(encoder streamEncoder) []byte {
 		}
 	}
 	return nil
+}
+
+// writeEncoderFailure 在编码器拒绝合法事件后合成协议内的错误终结帧
+// 尽力下发：错误消息携带累计助手内容（与解码器 fail 同形，Failure 走
+// 同一分类），终帧逐个写出并落调试记录；终帧编码再失败即放弃——编码器
+// 状态已不可信，写出失败同理，两条失败路径都不掩盖调用方返回的原错误。
+func (out *streamWriter) writeEncoderFailure(recorder *debuglog.Recorder, protocol protocolEncoder, encoder streamEncoder, latest *llm.AssistantMessage, cause error) {
+	failure := &llm.AssistantMessage{}
+	if latest != nil {
+		*failure = *latest
+	}
+	failure.StopReason = llm.StopReasonError
+	failure.ErrorMessage = cause.Error()
+	failure.Failure = llm.Classify(cause)
+	terminal, err := encoder.Encode(llm.ResponseEvent{
+		Type:   llm.ResponseEventError,
+		Reason: llm.StopReasonError,
+		Error:  failure,
+	})
+	if err != nil {
+		return
+	}
+	sink, _ := out.writer.(sseEventSink)
+	var batch []byte
+	for _, encoded := range terminal {
+		if sink != nil {
+			_ = out.writeEvent(sink, encoded.Name, encoded.Data)
+		} else {
+			batch = protocol.AppendSSE(batch, encoded.Name, encoded.Data)
+		}
+		if encoded.Name == common.SSEDone {
+			recorder.AppendJSONL(debuglog.StageHTTPResponse, encoded.Name, string(encoded.Data))
+		} else {
+			recorder.AppendJSONL(debuglog.StageHTTPResponse, encoded.Name, json.RawMessage(encoded.Data))
+		}
+	}
+	if len(batch) > 0 {
+		_ = out.writeContent(batch)
+	}
 }
 
 // collectPumpedMessage 从泵 channel 收集非流式最终消息。等待期间按
