@@ -430,9 +430,10 @@ type writeTask struct {
 // upsert/delete，替代整文件重写），但落库不在 s.mu 内联执行——s.mu
 // 同时守护 Resolve/Acquire/AllowRPM 等准入检查，一次 sqlite 抖动会
 // 瞬堵所有新请求鉴权。全部写经 writes 队列由单 worker 顺序落盘：
-// 入队发生在 s.mu 内，队列序即旧的锁内写序——先排的统计快照不会
+// 入队发生在 s.mu 内，队列序即旧的锁内写序——先排的统计增量不会
 // 覆盖后到的管理面写；管理面写的提交方同样在释锁后才等落库结果。
-// 统计写是全量行快照，丢弃中间帧由下一帧自愈。
+// 统计写按增量合入（ApplyTokenDelta），队列满丢弃单帧由下一帧自愈；
+// 管理面写是全量快照，行级覆盖即管理动作的显式意图。
 // LastUsedAt 只在内存里更新，随本行下一次写回顺带持久化。
 // 返回 *Token 的方法（Resolve/Get/Lookup*/List/Ensure）一律给
 // 深拷贝快照：签发后管理员改单不影响在途请求，这就是正确语义。
@@ -886,11 +887,13 @@ func costWindowName(window string) string {
 	return window
 }
 
-// AddResult 回写一次完成请求的统计与费用窗口，并把该行写回表——与文件
-// 时代同为每请求持久化；写库失败不阻塞请求收尾（内存态仍在，行写是
-// 全量快照，下次成功写自动收敛）。口径对齐 ccLoad updateTokenStats：
+// AddResult 回写一次完成请求的统计与费用窗口，并把该行的增量写回表——
+// 与文件时代同为每请求持久化；写库失败不阻塞请求收尾（内存态仍在，
+// 增量按窗口合入，下次成功写自动收敛）。口径对齐 ccLoad updateTokenStats：
 // 499 整次跳过；token/费用只在 2xx 时累加；TTFB/RT 均值与流式计数对
-// 全部非 499 行更新（失败流也计入均值样本）。
+// 全部非 499 行更新（失败流也计入均值样本）。持久化走增量合入而非
+// 全量快照：reuseport 交接的重叠期里新旧进程同活同写，快照互覆会
+// 永久抹掉先提交方的贡献，增量对任意交错收敛。
 func (s *Store) AddResult(id int64, r Result) {
 	if r.StatusCode == 499 {
 		return
@@ -903,6 +906,7 @@ func (s *Store) AddResult(id int64, r Result) {
 	}
 	now := time.Now().UnixMilli()
 	t.LastUsedAt = &now
+	var micro int64
 	if r.Stream {
 		t.StreamCount++
 		t.StreamAvgTTFB += (r.FirstByteSec - t.StreamAvgTTFB) / float64(t.StreamCount)
@@ -911,12 +915,12 @@ func (s *Store) AddResult(id int64, r Result) {
 		t.NonStreamAvgRT += (r.DurationSec - t.NonStreamAvgRT) / float64(t.NonStreamCount)
 	}
 	if r.StatusCode >= 200 && r.StatusCode < 300 {
+		micro = usdToMicro(r.CostUSD)
 		t.SuccessCount++
 		t.PromptTokensTotal += r.InputTokens
 		t.CompletionTokensTotal += r.OutputTokens
 		t.CacheReadTokensTotal += r.CacheReadTokens
 		t.CacheCreationTokensTotal += r.CacheWriteTokens
-		micro := usdToMicro(r.CostUSD)
 		t.TotalCostUSD += r.CostUSD
 		t.EffectiveCostUSD += r.CostUSD // 本服务无渠道倍率，effective=total
 		t.CostUsedMicroUSD += micro
@@ -944,9 +948,33 @@ func (s *Store) AddResult(id int64, r Result) {
 	} else {
 		t.FailureCount++
 	}
-	row := rowFromToken(t)
+	// 统计写按增量合入：base 仅供 INSERT 分支补配置列，冲突分支只读
+	// 增量。窗口键取写后内存翻窗值，与落库行同窗则累加、异窗替换。
+	delta := &store.TokenResultDelta{
+		ID:         t.ID,
+		LastUsedAt: now,
+		Stream:     r.Stream,
+		Success:    r.StatusCode >= 200 && r.StatusCode < 300,
+	}
+	if delta.Stream {
+		delta.LatencySampleSec = r.FirstByteSec
+	} else {
+		delta.LatencySampleSec = r.DurationSec
+	}
+	if delta.Success {
+		delta.PromptTokens = r.InputTokens
+		delta.CompletionTokens = r.OutputTokens
+		delta.CacheReadTokens = r.CacheReadTokens
+		delta.CacheWriteTokens = r.CacheWriteTokens
+		delta.CostUSD = r.CostUSD
+		delta.CostMicroUSD = micro
+		delta.DayStart = t.DailyPeriodStart
+		delta.MonthStart = t.MonthlyPeriodStart
+		delta.Anchor5h = t.Cost5hAnchor
+		delta.WeekAnchor = t.CostWeeklyPeriodStart
+	}
 	s.submitStats(func(ctx context.Context) error {
-		return s.db.UpsertToken(ctx, row)
+		return s.db.ApplyTokenDelta(ctx, rowFromToken(t), delta)
 	})
 }
 

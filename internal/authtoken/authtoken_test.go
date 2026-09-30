@@ -439,3 +439,70 @@ func TestCloseStopsWriteWorker(t *testing.T) {
 		t.Fatal("writeDone still open after Close")
 	}
 }
+
+// flushTokenWrites 借写队列的哨兵任务等它之前的全部统计写落库——
+// AddResult 是火忘，跨进程断言前必须先排空本进程队列。
+func flushTokenWrites(t *testing.T, s *Store) {
+	t.Helper()
+	done := make(chan error, 1)
+	select {
+	case s.writes <- writeTask{run: func(context.Context) error { return nil }, done: done}:
+	case <-time.After(syncEnqueueTimeout):
+		t.Fatal("write queue saturated")
+	}
+	<-done
+}
+
+// TestAddResultConvergesAcrossProcesses 钉住交接重叠期的统计双写语义：
+// reuseport 交接的排空窗口里新旧两个进程同活、各持水合后的独立内存态，
+// 交错记账必须按增量合入同一行——全量快照是行级 last-writer-wins，先
+// 提交方在重叠期的贡献被永久抹掉，费用窗口随之漏记、限额被少执行。
+func TestAddResultConvergesAcrossProcesses(t *testing.T) {
+	st := openDB(t)
+	a, err := New(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _, err := a.Ensure("conv", &Token{Description: "t", IsActive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.AddResult(tok.ID, Result{StatusCode: 200, CostUSD: 1.0})
+	flushTokenWrites(t, a)
+
+	// 交接：新进程从库水合（含第一笔与窗口锚），旧进程继续服役，
+	// 两边交错记账——正是 reuseport 排空期的真实形态。
+	b, err := New(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.AddResult(tok.ID, Result{StatusCode: 200, CostUSD: 1.0})
+	b.AddResult(tok.ID, Result{StatusCode: 200, CostUSD: 2.0})
+	a.AddResult(tok.ID, Result{StatusCode: 200, CostUSD: 1.0})
+	b.AddResult(tok.ID, Result{StatusCode: 200, CostUSD: 2.0})
+	flushTokenWrites(t, a)
+	flushTokenWrites(t, b)
+	a.Close()
+	b.Close()
+
+	final, err := New(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Close()
+	got, ok := final.Get(tok.ID)
+	if !ok {
+		t.Fatal("token missing after rehydration")
+	}
+	const wantMicro = 7_000_000 // 1.0（交接前）+ 1.0+2.0+1.0+2.0（重叠交错）
+	if got.CostUsedMicroUSD != wantMicro || got.DailyUsedMicroUSD != wantMicro ||
+		got.MonthlyUsedMicroUSD != wantMicro || got.Cost5hUsedMicroUSD != wantMicro ||
+		got.CostWeeklyUsedMicroUSD != wantMicro {
+		t.Fatalf("cost windows = total:%d daily:%d monthly:%d 5h:%d weekly:%d, want %d each",
+			got.CostUsedMicroUSD, got.DailyUsedMicroUSD, got.MonthlyUsedMicroUSD,
+			got.Cost5hUsedMicroUSD, got.CostWeeklyUsedMicroUSD, wantMicro)
+	}
+	if got.SuccessCount != 5 {
+		t.Fatalf("SuccessCount = %d, want 5", got.SuccessCount)
+	}
+}
