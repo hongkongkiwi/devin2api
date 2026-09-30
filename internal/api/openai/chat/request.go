@@ -281,6 +281,8 @@ func appendMessage(context *llm.RequestMessages, message Message, callIDs map[st
 			context.Dropped = append(context.Dropped, "empty_message:"+message.Role)
 		}
 		text := common.ContentText(content)
+		// 非文本块在纯文本系统提示里没有通道，丢弃必须留痕。
+		common.MarkNonTextParts(content, &context.Dropped)
 		context.SystemPrompt = common.AppendSystemPrompt(context.SystemPrompt, text)
 	case "user":
 		content, err := decodeUserContent(context, message.Content)

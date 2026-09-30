@@ -2547,9 +2547,13 @@ func (recorder *Recorder) NoteUpstreamConn(reused bool, idle time.Duration) {
 // flushAll 在收尾落库后解除；需要「payload 已可对外读」语义的
 // 调用方（取证导出、测试断言）经 Drained 自行等待。
 // 幂等：二次调用直接返回——否则 meta.json 与日志行会重复落一份。
-func (recorder *Recorder) Complete(completion Completion) {
+// Complete 收口请求：落完结戳、按 aborted 位把 disconnected 重映射成
+// aborted，并返回重映射后的完结快照——调用方的 metrics/stderr 摘要与
+// meta.json 用同一份结果，三处归因口径不会分叉。返回值允许忽略
+// （不关心归因对齐的调用点照旧传值即可）。
+func (recorder *Recorder) Complete(completion Completion) Completion {
 	if recorder == nil {
-		return
+		return completion
 	}
 	// 完结时刻在请求 goroutine 上打戳：此后哨兵要走的分片队列、
 	// insertQ 与批量事务等待全部排除在 duration_ms 之外——写侧
@@ -2561,7 +2565,7 @@ func (recorder *Recorder) Complete(completion Completion) {
 	recorder.mutex.Lock()
 	if recorder.closed {
 		recorder.mutex.Unlock()
-		return
+		return completion
 	}
 	recorder.closed = true
 	// 完结块与 closed 同锁落位：closed 可观察即 completion 可读——
@@ -2617,6 +2621,7 @@ func (recorder *Recorder) Complete(completion Completion) {
 	case <-manager.workerGone:
 		fallback()
 	}
+	return completion
 }
 
 // appendJSONL 把一行已序列化记录追加进指定 JSONL 文件的缓冲，并把本

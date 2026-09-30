@@ -61,8 +61,10 @@ func (s *Store) InsertResponse(ctx context.Context, response StoredResponse) err
 }
 
 // ResponseByID 取一条本租户的存储响应；查无此行返回 ErrResponseNotFound。
+// 走只读池——续链按代数逐级查询，写池排队会让面板/读流量饿死在
+// 长事务后面，与 store 读写分池的初衷相悖。
 func (s *Store) ResponseByID(ctx context.Context, id, keyHash string) (StoredResponse, error) {
-	row := s.db.QueryRowContext(ctx,
+	row := s.ro.QueryRowContext(ctx,
 		`SELECT parent_id, status, created_at, expires_at, input_json, response_json
 		 FROM responses WHERE id = ? AND key_hash = ?`, id, keyHash)
 	response, err := scanStoredResponse(row, id)

@@ -556,14 +556,16 @@ func (encoder *StreamEncoder) event(name string, payload map[string]any) SSEEven
 	return SSEEvent{Name: name, Data: data}
 }
 
-// blockDelta 覆盖 content_block_delta 的四种增量形态；各形态键位互斥，
-// omitempty 保证 wire 键集与原 map 逐字节一致。
+// blockDelta 覆盖 content_block_delta 的四种增量形态；text/thinking/
+// signature 沿用 omitempty 省键，partial_json 恒在——Anthropic 客户端
+// 按 partial_json += 累积工具参数，空串是合法增量，键缺席会让按
+// undefined 累积的客户端拼出垃圾。
 type blockDelta struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
 	Thinking    string `json:"thinking,omitempty"`
 	Signature   string `json:"signature,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"`
+	PartialJSON string `json:"partial_json"`
 }
 
 // blockDeltaEvent 是 content_block_delta 的固定外壳。

@@ -875,7 +875,9 @@ func (application *App) createCompletion(
 		}
 	}
 	defer func() {
-		recorder.Complete(completion)
+		// Complete 返回按 aborted 位重映射后的完结快照：面板中断在
+		// metrics/stderr 摘要与 meta.json 三处同归因，不再各说各话。
+		completion = recorder.Complete(completion)
 		reqMetrics.Finish(completion.StatusCode, responseBytes, completion.Result)
 		if authTok != nil && !tokenBlocked {
 			// 令牌统计回写（ccLoad updateTokenStats 同口径：499 跳过、
@@ -1122,6 +1124,7 @@ func (application *App) createCompletion(
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || streamCtx.Err() != nil {
 			// 同 streamCompletion 的取消收口：ctx 已取消时 Cause 是权威
 			// 归因，物化错误由复合包裹留在 message 里取证。
+			responseBytes = out.bytes
 			out.finishDisconnected(&completion, disconnectCause(streamCtx, err))
 			return
 		}
@@ -1130,9 +1133,13 @@ func (application *App) createCompletion(
 			// 前导 \n 是合法 JSON 空白，客户端解析出 error 字段。
 			completion.StatusCode = http.StatusOK
 			if writeErr := out.writeContent(protocol.EncodeError(err, debugRef(recorder))); writeErr != nil {
+				responseBytes = out.bytes
 				out.finishDisconnected(&completion, writeErr)
 				return
 			}
+			// 心跳与错误体的写出字节与流式路径同口径进 metrics——
+			// 提前退出不再漏记已交付流量。
+			responseBytes = out.bytes
 			recorder.WriteError(debuglog.ErrStageResponseEvent, err)
 			return
 		}
@@ -1148,6 +1155,7 @@ func (application *App) createCompletion(
 		return
 	}
 	if err := out.writeContent(body); err != nil {
+		responseBytes = out.bytes
 		out.finishDisconnected(&completion, err)
 		return
 	}

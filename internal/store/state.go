@@ -94,7 +94,21 @@ func (s *Store) StateQueueDrops() int64 {
 // 直到关停信号，随后排空存量退出——排空带总预算，写面卡死时关库不
 // 被整队重放拖住。
 func (s *Store) runStateQueue() {
-	defer close(s.stateQueueDone)
+	defer func() {
+		// 先闭闸再清尾：QueueState 的退场预检以 stateQueueDone 为界，
+		// close 后不再有新入队；缓冲里残存的是排空预算没带走的存量与
+		// 「预检通过、发送落在闭闸前」的竞态条目——逐条补记 drop，
+		// 「丢行有计数」的台账承诺对关停窗口同样成立。
+		close(s.stateQueueDone)
+		for {
+			select {
+			case <-s.stateQueue:
+				s.stateQueueDrops.Add(1)
+			default:
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case w := <-s.stateQueue:

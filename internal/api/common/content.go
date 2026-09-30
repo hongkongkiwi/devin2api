@@ -660,6 +660,30 @@ func ContentText(content []llm.Content) string {
 	return builder.String()
 }
 
+// MarkNonTextParts 记账被 ContentText 静默丢弃的非文本块：system/
+// developer 分支把解出的 image/file/video 拼进纯文本系统提示时没有
+// 通道，「解码即过滤」要求每个损失可对账（DecodeContent 的
+// content_part:<type> 同词表；anthropic 面用 system_block:<type> 同义
+// 记账）。未知块类型宁可记 unknown 也不从账面上消失。
+func MarkNonTextParts(content []llm.Content, dropped *[]string) {
+	for _, block := range content {
+		var name string
+		switch block.(type) {
+		case llm.TextContent:
+			continue
+		case llm.ImageContent:
+			name = "image"
+		case llm.DocumentContent:
+			name = "file"
+		case llm.VideoContent:
+			name = "video"
+		default:
+			name = "unknown"
+		}
+		*dropped = append(*dropped, "content_part:"+name)
+	}
+}
+
 // ClassifySignatureType 按内容形态识别可回放思考签名的上游体制：
 // sealed.* 是本代理下发过的密封格式；序列化 Responses reasoning item
 // 数组是 openai 体制（上游 signature 字段的实测形态）。signature_type

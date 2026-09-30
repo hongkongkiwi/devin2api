@@ -833,6 +833,8 @@ func appendMessageItem(context *llm.RequestMessages, raw json.RawMessage, role s
 	case "system", "developer":
 		dropPendingReasoning(context, pending)
 		text := common.ContentText(content)
+		// 非文本块在纯文本系统提示里没有通道，丢弃必须留痕。
+		common.MarkNonTextParts(content, &context.Dropped)
 		context.SystemPrompt = common.AppendSystemPrompt(context.SystemPrompt, text)
 	}
 	return nil
